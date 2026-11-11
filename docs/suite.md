@@ -42,14 +42,19 @@ keyhop verifies its parent process before unlocking anything. Every check must p
 
 | Check | How |
 |---|---|
-| Executable is the pinned runtime | `lsof -a -p <ppid> -d txt -Fn`: the first `n` line must equal the pinned runtime real path, and the file's SHA-256 must match |
-| argv is exactly `<runtime> <entry> [args…]` | `ps -ww -o command= -p <ppid>`. No runtime flags before the entry (`--import`, `-r`, `--require`, `-e`, …). The entry's real path must match. |
-| No code-injecting environment | `ps -E -ww -o command= -p <ppid>` must not contain `NODE_OPTIONS`, `NODE_PATH`, `BUN_OPTIONS`, `DYLD_*` or `LD_PRELOAD`. If the environment can't be read, refuse. |
-| Tree unchanged | Recompute the root's tree hash; it must equal the pinned one |
-| Platform | macOS and Linux. Windows returns exit 3 for now |
+| Executable is the pinned runtime | `lsof -a -p <ppid> -d txt -Fn`, real path and SHA-256 match |
+| argv is exactly `<runtime> <entry> [args…]` | Read from the kernel (`KERN_PROCARGS2` on macOS, `/proc` on Linux), not `ps` text. No runtime flags before the entry. The entry must be absolute, inside the root, with a matching real path. |
+| No code-injecting environment | Refuses any `NODE_*` or `BUN_*` except `NODE_ENV`, `NODE_NO_WARNINGS` and `NODE_DISABLE_COLORS`. Refuses every `DYLD_*` and `LD_*`. An unreadable or empty environment is refused. |
+| Working folder inside the root | Runtimes read config from the working folder, so client launchers `cd` into their app folder and pass the caller's folder on (vpnhop uses `VPNHOP_CWD`) |
+| Tree unchanged | The root's tree hash matches. Symlinks are refused, so npm installs need `--no-bin-links`. A root under a world-writable directory is refused. |
+| Bun runtimes | No `.bunfig.toml` in home |
+| Platform | macOS and Linux. Windows exits 3 |
+
+- **Order of checks:** before any prompt, the caller is checked against `clients.json`, a non-secret copy of the pins. After the unlock, the pin stored in the vault must match it.
 
 - Access rules:
   - Names starting with the client's prefix: allowed after an unlock.
+- "Always allow" grants are bound to the secret's origin.
   - Other names (for example a VPN password your 1Password sync already puts in keyhop) need a per-client grant. keyhop shows its dialog with the client name, the names and the `purpose` (made inert, as `approve.ts` does), then Touch ID. "Always" stores the grant in `clients[name].allow`.
 - Each call is a separate process, so it prompts Touch ID (`unlock`) once. Clients cache the values in memory for their own lifetime.
 - `purpose` is shown in the dialog and capped at 200 characters.
