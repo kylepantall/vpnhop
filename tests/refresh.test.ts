@@ -23,3 +23,16 @@ test('stale means started more than a second before the install', () => {
   assert.equal(isStale({ pid: 1, ppid: 1, startedAt: new Date('2026-11-02T08:54:58Z') }, builtAt), true);
   assert.equal(isStale({ pid: 1, ppid: 1, startedAt: new Date('2026-11-02T08:54:59.5Z') }, builtAt), false);
 });
+
+test('danglingReason keeps healthy shared tunnels, removes stopped, orphaned and outdated ones', async () => {
+  const { danglingReason } = await import('../src/refresh.ts');
+  const { profileHash } = await import('../src/tunnels.ts');
+  const { parseConfig } = await import('../src/config.ts');
+  const config = parseConfig(JSON.stringify({ profiles: { aws: { type: 'openvpn', config: 'a.ovpn' } } }), '/c/config.json');
+  const hash = profileHash(config.profiles.aws!, 'img:1');
+  assert.equal(danglingReason({ state: 'running', profile: 'aws', hash }, config, 'img:1'), null);
+  assert.ok(danglingReason({ state: 'exited', profile: 'aws', hash }, config, 'img:1'));
+  assert.ok(danglingReason({ state: 'running', profile: 'gone', hash }, config, 'img:1'));
+  assert.ok(danglingReason({ state: 'running', profile: 'aws', hash }, config, 'img:2'));
+  assert.equal(danglingReason({ state: 'running', profile: 'gone', hash }, null, 'img:1'), null);
+});

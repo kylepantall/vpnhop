@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 export type DockerResult = { code: number; stdout: Buffer; stderr: string; truncated: boolean };
 export type DockerOptions = { input?: Buffer | string; timeoutMs?: number; maxStdout?: number };
@@ -49,7 +49,3 @@ export function createDocker(bin = process.env.VPNHOP_DOCKER ?? 'docker'): Docke
     });
 }
 
-/** Synchronous best-effort removal, for process exit handlers. */
-export function removeContainersSync(names: string[], bin = process.env.VPNHOP_DOCKER ?? 'docker'): void {
-  if (names.length) spawnSync(bin, ['rm', '-f', ...names], { stdio: 'ignore', timeout: 20_000 });
-}

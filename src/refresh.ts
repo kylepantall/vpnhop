@@ -2,17 +2,20 @@
  * Refresh this install's MCP servers and close dangling tunnels:
  * - servers older than the installed build, or orphaned (their client died, ppid 1): SIGTERM.
  *   Each client starts the installed version on reconnect.
- * - current servers: SIGHUP, which drops their tunnels; the next call reconnects.
- * - then any vpnhop tunnel container still left (crashed server, deleted profile) is removed,
- *   and runtime images from older builds are deleted.
+ * - current servers: SIGHUP, which drops the secrets and state they cached.
+ * - tunnels are shared and leased, so healthy ones stay up. Removed: stopped tunnels, tunnels
+ *   for profiles no longer in the config, and tunnels built from an older profile or image
+ *   (the next call recreates those). Runtime images from older builds are deleted.
  * Shared by `vpnhop refresh` and the `refresh` tool. Mirrors hopsql's refresh.
  */
 
 import { execFileSync } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import type { Config } from './config.ts';
 import type { Docker } from './docker.ts';
 import { runtimeImageTag } from './image.ts';
+import { profileHash } from './tunnels.ts';
 
 export interface ServerProcess {
   pid: number;
@@ -23,11 +26,11 @@ export interface ServerProcess {
 export interface RefreshResult {
   /** Older than the installed build or orphaned: stopped, reconnect to restart. */
   stopped: number[];
-  /** Current: told to drop their tunnels. */
+  /** Current: told to drop cached secrets and state. */
   recycled: number[];
   failed: number[];
-  /** Tunnel containers no live server owned. */
-  removedTunnels: string[];
+  /** Stopped, orphaned (profile deleted) or outdated tunnel containers. */
+  removedTunnels: { container: string; reason: string }[];
   removedImages: string[];
 }
 
@@ -106,19 +109,29 @@ export function refreshServers(
   return result;
 }
 
-/** Removes every vpnhop tunnel container except `keep`, and runtime images other than the current one. */
-export async function removeDangling(docker: Docker, keep: string[] = []): Promise<Pick<RefreshResult, 'removedTunnels' | 'removedImages'>> {
-  const removedTunnels: string[] = [];
+/** Why a tunnel container should go, or null to keep it. */
+export function danglingReason(c: { state: string; profile: string; hash: string }, config: Config | null, image: string): string | null {
+  if (c.state !== 'running') return `not running (${c.state})`;
+  if (!config) return null; // can't judge profiles without a config; leave running tunnels alone
+  const profile = Object.hasOwn(config.profiles, c.profile) ? config.profiles[c.profile] : undefined;
+  if (!profile) return 'profile no longer in config';
+  if (c.hash !== profileHash(profile, image)) return 'profile or runtime changed';
+  return null;
+}
+
+export async function removeDangling(docker: Docker, config: Config | null): Promise<Pick<RefreshResult, 'removedTunnels' | 'removedImages'>> {
+  const removedTunnels: RefreshResult['removedTunnels'] = [];
   const removedImages: string[] = [];
-  const ps = await docker(['ps', '-a', '--filter', 'label=vpnhop.profile', '--format', '{{.Names}}']);
-  for (const name of ps.stdout.toString('utf8').split('\n').filter(Boolean)) {
-    if (keep.includes(name)) continue;
-    if ((await docker(['rm', '-f', name])).code === 0) removedTunnels.push(name);
+  const image = runtimeImageTag();
+  const ps = await docker(['ps', '-a', '--filter', 'label=vpnhop.profile', '--format', '{{.Names}}\t{{.State}}\t{{.Label "vpnhop.profile"}}\t{{.Label "vpnhop.hash"}}']);
+  for (const line of ps.stdout.toString('utf8').split('\n').filter(Boolean)) {
+    const [container = '', state = '', profile = '', hash = ''] = line.split('\t');
+    const reason = danglingReason({ state, profile, hash }, config, image);
+    if (reason && (await docker(['rm', '-f', container])).code === 0) removedTunnels.push({ container, reason });
   }
-  const current = runtimeImageTag();
   const images = await docker(['images', '--filter', 'label=vpnhop.runtime=1', '--format', '{{.Repository}}:{{.Tag}}']);
   for (const tag of new Set(images.stdout.toString('utf8').split('\n').filter(Boolean))) {
-    if (tag === current || tag.endsWith(':<none>')) continue;
+    if (tag === image || tag.endsWith(':<none>')) continue;
     if ((await docker(['rmi', tag])).code === 0) removedImages.push(tag);
   }
   return { removedTunnels, removedImages };
@@ -127,21 +140,20 @@ export async function removeDangling(docker: Docker, keep: string[] = []): Promi
 export const RECONNECT_HINT =
   'Reconnect vpnhop in each MCP client (Claude Code: /mcp → vpnhop → Reconnect) to start the installed version.';
 
-export async function refresh(docker: Docker, { selfPid = process.pid, keep = [] as string[], settleMs = 1500 } = {}): Promise<RefreshResult> {
+export async function refresh(docker: Docker, config: Config | null, { selfPid = process.pid } = {}): Promise<RefreshResult> {
   const servers = refreshServers(selfPid);
-  // Let signalled servers remove their own tunnels before sweeping what's left.
-  if (servers.stopped.length || servers.recycled.length) await new Promise((r) => setTimeout(r, settleMs));
-  return { ...servers, ...(await removeDangling(docker, keep)) };
+  return { ...servers, ...(await removeDangling(docker, config)) };
 }
 
-export async function runRefresh(docker: Docker, args: string[]): Promise<void> {
+export async function runRefresh(docker: Docker, config: Config | null, args: string[]): Promise<void> {
   if (args.length) throw new Error(`Unknown option: ${args[0]}. Usage: vpnhop refresh`);
   if (process.platform === 'win32') throw new Error('vpnhop refresh is not available on Windows; restart your MCP client instead.');
-  const r = await refresh(docker);
+  const r = await refresh(docker, config);
   const say = (line: string) => process.stdout.write(line + '\n');
-  say(`Recycled ${r.recycled.length} current server(s): their tunnels were closed and reconnect on the next call.`);
+  say(`Recycled ${r.recycled.length} current server(s): cached secrets dropped.`);
   say(`Stopped ${r.stopped.length} outdated or orphaned server(s).`);
   say(`Removed ${r.removedTunnels.length} dangling tunnel(s) and ${r.removedImages.length} old image(s).`);
+  for (const t of r.removedTunnels) say(`  ${t.container}: ${t.reason}`);
   if (r.stopped.length) say(RECONNECT_HINT);
   if (r.failed.length) say(`Could not signal: ${r.failed.join(', ')}`);
 }

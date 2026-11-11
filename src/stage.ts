@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename, dirname } from 'node:path';
-import type { Profile, SecretRef } from './config.ts';
+import type { ConfigSource, Profile, SecretRef } from './config.ts';
 import { resolvePath } from './config.ts';
 import type { SecretResolver } from './secrets.ts';
 import type { TarEntry } from './tar.ts';
@@ -147,6 +147,22 @@ ${secrets}
 `;
 }
 
+/** A profile file from disk, or from keyhop (then it is a secret, and has no sibling files). */
+async function profileText(source: ConfigSource, baseDir: string, what: string, resolve: SecretResolver, secrets: Record<string, string>): Promise<{ text: string; dir?: string }> {
+  if (typeof source === 'string') {
+    return { text: (await readProfileFile(source, baseDir, what)).toString('utf8'), dir: dirname(resolvePath(source, baseDir)) };
+  }
+  const text = await resolve(source, what);
+  secrets[what] = text;
+  // VPN clients echo config lines in parse errors, so redact each line, and each argument
+  // (not the directive name, which logs mention harmlessly), on its own.
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length >= 8);
+  lines.forEach((line, i) => (secrets[`${what} line ${i + 1}`] = line));
+  const args = new Set(lines.flatMap((l) => l.split(/\s+/).slice(1)).filter((t) => t.length >= 8));
+  [...args].forEach((arg, i) => (secrets[`${what} value ${i + 1}`] = arg));
+  return { text };
+}
+
 export async function stage(profile: Profile, baseDir: string, resolve: SecretResolver): Promise<Staged> {
   const secrets: Record<string, string> = {};
   const get = async (ref: SecretRef | undefined, label: string) => {
@@ -162,9 +178,9 @@ export async function stage(profile: Profile, baseDir: string, resolve: SecretRe
 
   switch (profile.type) {
     case 'openvpn': {
-      const path = resolvePath(profile.config, baseDir);
-      const text = (await readProfileFile(profile.config, baseDir, 'openvpn config')).toString('utf8');
-      const { config, files } = await rewriteOvpn(text, dirname(path));
+      const { text, dir } = await profileText(profile.config, baseDir, 'openvpn config', resolve, secrets);
+      // A keyhop-held profile is self-contained (vpnhop add inlines its files); `dir` only exists on disk.
+      const { config, files } = await rewriteOvpn(text, dir ?? '/nonexistent');
       entries.push({ name: 'vpn/files', dir: true, mode: 0o700 }, ...files, { name: 'vpn/config.ovpn', data: config });
       const username = await get(profile.username, 'username');
       const password = await get(profile.password, 'password');
@@ -179,7 +195,7 @@ export async function stage(profile: Profile, baseDir: string, resolve: SecretRe
       break;
     }
     case 'wireguard': {
-      let conf = (await readProfileFile(profile.config, baseDir, 'wireguard config')).toString('utf8');
+      let conf = (await profileText(profile.config, baseDir, 'wireguard config', resolve, secrets)).text;
       const key = await get(profile.privateKey, 'privateKey');
       if (key) conf = setWireGuardKey(conf, key);
       else if (!/^\s*PrivateKey\s*=/im.test(conf)) throw new Error('wireguard config has no PrivateKey and no privateKey ref');

@@ -22,6 +22,22 @@ mark_ready() {
   log "VPNHOP_READY"
 }
 
+# Shared tunnels are leased: every request or `vpnhop proxy` touches the lease
+# (lease-exec.sh / socks.sh), and the tunnel stops itself once it goes stale.
+LEASE=/run/vpnhop/lease
+IDLE="${VPNHOP_IDLE_SECONDS:-1800}"
+touch "$LEASE"
+(
+  while sleep 10; do
+    age=$(( $(date +%s) - $(stat -c %Y "$LEASE" 2>/dev/null || echo 0) ))
+    if [ "$age" -gt "$IDLE" ]; then
+      echo "vpnhop: lease expired after ${IDLE}s idle"
+      kill -TERM 1
+      exit 0
+    fi
+  done
+) &
+
 PID=""
 stop() {
   log "stopping"

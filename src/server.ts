@@ -1,6 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Config } from './config.ts';
+import { PROFILE_NAME } from './config.ts';
+import type { Keyhop } from './keyhop.ts';
+import { removeProfile, saveProfile } from './profiles.ts';
 import { RequestInput } from './request.ts';
 import type { Tunnels } from './tunnels.ts';
 import { VERSION } from './version.ts';
@@ -17,7 +20,7 @@ async function respond(work: () => Promise<unknown>): Promise<ToolResult> {
 
 const profileName = z.string().min(1).describe('Profile name from list_profiles.');
 
-export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefresh?: () => Promise<unknown>): McpServer {
+export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefresh?: () => Promise<unknown>, keyhop?: Keyhop): McpServer {
   const server = new McpServer(
     { name: 'vpnhop', version: VERSION },
     {
@@ -25,7 +28,8 @@ export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefre
         'vpnhop reaches APIs that sit behind a VPN without connecting this machine to it. Each profile runs ' +
         'its VPN (OpenVPN, WireGuard, OpenConnect/AnyConnect/GlobalProtect/Pulse/Fortinet/F5, IPsec IKEv2) ' +
         'inside its own Docker container. Call list_profiles, then http_request with a profile: it connects ' +
-        'on demand, resolves DNS inside the tunnel, and disconnects after the profile is idle. VPN ' +
+        'on demand, resolves DNS inside the tunnel, and stops after the profile is idle. Profiles are ' +
+        'saved encrypted in keyhop (save_profile takes a file path; the user confirms with Touch ID). VPN ' +
         'credentials are never shown. Some profiles only allow certain hosts (allowHosts).',
     }
   );
@@ -97,15 +101,52 @@ export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefre
     (input) => respond(() => tunnels.request(input))
   );
 
+  if (keyhop) {
+    server.registerTool(
+      'save_profile',
+      {
+        title: 'Save a VPN profile',
+        description:
+          'Saves a VPN profile from a file on this machine (.ovpn or WireGuard .conf) into the encrypted keyhop ' +
+          'vault; the user confirms with Touch ID. Referenced cert/key files and an auth-user-pass file are ' +
+          'inlined. You never see the contents. Profiles that need a password not in the file, or ' +
+          'OpenConnect/IPsec profiles, must be added by the user in a terminal: vpnhop add.',
+        inputSchema: {
+          name: z.string().regex(PROFILE_NAME).describe('Profile name: lowercase letters, digits, - and _.'),
+          file: z.string().min(1).describe('Absolute path to the .ovpn or WireGuard .conf file.'),
+          type: z.enum(['openvpn', 'wireguard']).optional(),
+          description: z.string().max(200).optional(),
+          allowHosts: z.array(z.string()).optional().describe('Hosts http_request may reach through this profile.'),
+        },
+        annotations: { destructiveHint: false, openWorldHint: false },
+      },
+      (input) => respond(() => saveProfile(keyhop, input))
+    );
+    server.registerTool(
+      'remove_profile',
+      {
+        title: 'Remove a VPN profile',
+        description: 'Deletes a saved profile and its keyhop secrets (the user confirms with Touch ID), and stops its tunnel.',
+        inputSchema: { profile: profileName },
+        annotations: { destructiveHint: true, idempotentHint: true },
+      },
+      ({ profile }) =>
+        respond(async () => {
+          await tunnels.disconnect(profile).catch(() => {});
+          return removeProfile(keyhop, loadConfig(), profile);
+        })
+    );
+  }
+
   if (onRefresh)
     server.registerTool(
       'refresh',
       {
         title: 'Refresh vpnhop',
         description:
-          'Closes every tunnel (they reconnect on the next call), recycles other running vpnhop servers, ' +
-          'stops outdated or orphaned ones, and removes dangling tunnel containers and old runtime images. ' +
-          'Use after a tunnel gets stuck or after updating vpnhop.',
+          'Recycles running vpnhop servers (cached secrets dropped), stops outdated or orphaned ones, and ' +
+          'removes stopped, orphaned or outdated tunnel containers and old runtime images. Healthy tunnels ' +
+          'stay up. Use after updating vpnhop or editing profiles; disconnect a stuck tunnel instead.',
         inputSchema: {},
         annotations: { destructiveHint: false, idempotentHint: true },
       },

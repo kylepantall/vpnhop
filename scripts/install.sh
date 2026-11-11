@@ -110,7 +110,8 @@ main() {
   fi
 
   step 'Installing dependencies'
-  (cd "$staging" && PATH="$(dirname "$node_bin"):$PATH" quiet "$npm_bin" ci --omit=dev --ignore-scripts --no-audit --no-fund)
+  # --no-bin-links: keyhop refuses symlinks in a client's tree (node_modules/.bin).
+  (cd "$staging" && PATH="$(dirname "$node_bin"):$PATH" quiet "$npm_bin" ci --omit=dev --ignore-scripts --no-audit --no-fund --no-bin-links)
   info 'Done'
 
   step 'Building the VPN runtime image'
@@ -131,11 +132,34 @@ main() {
   {
     printf '#!/usr/bin/env bash\n'
     printf 'export VPNHOP_LAUNCHER=%q\n' "$bin_dir/vpnhop"
+    # Runtime and loader variables can inject code; keyhop refuses to serve a client that has them.
+    printf 'for v in $(env | sed -nE "s/^((NODE|BUN|DYLD|LD)_[A-Za-z0-9_]*)=.*/\\1/p"); do unset "$v"; done\n'
+    # Start in our own folder (keyhop requires it: runtimes read config from the working folder)
+    # and pass the caller's folder on, for relative paths like `vpnhop add ./work.ovpn`.
+    printf 'export VPNHOP_CWD="$PWD"\n'
+    printf 'cd %q || exit 1\n' "$install_dir/app"
     printf 'exec %q %q "$@"\n' "$node_bin" "$install_dir/app/src/index.ts"
   } > "$launcher"
   chmod +x "$launcher"
   mv -f "$launcher" "$bin_dir/vpnhop"
   info "$bin_dir/vpnhop (version $("$bin_dir/vpnhop" --version 2>&1))"
+
+  # Saved profiles live in keyhop. It pins this install (runtime, entry, file tree), so every
+  # install or update re-registers, which asks for Touch ID once.
+  step 'keyhop (encrypted profiles)'
+  local keyhop_bin="${VPNHOP_KEYHOP_BIN:-$HOME/.local/bin/keyhop}"
+  [[ -x "$keyhop_bin" ]] || keyhop_bin="$(command -v keyhop || true)"
+  if [[ "${VPNHOP_SKIP_KEYHOP:-}" == 1 ]]; then
+    info 'Skipped (VPNHOP_SKIP_KEYHOP=1)'
+  elif [[ -n "$keyhop_bin" ]] && "$keyhop_bin" client list >/dev/null 2>&1; then
+    info 'Registering vpnhop as a keyhop client (confirm with Touch ID)'
+    if ! VPNHOP_KEYHOP_BIN="$keyhop_bin" "$bin_dir/vpnhop" keyhop-register; then
+      info 'Not registered; rerun later with: vpnhop keyhop-register'
+    fi
+  else
+    info 'keyhop 0.7+ not found: profiles still work from files and env vars, but saving them'
+    info 'encrypted needs keyhop: https://github.com/kylepantall/keyhop'
+  fi
 
   step 'Config'
   local config="${VPNHOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnhop/config.json}"

@@ -68,3 +68,13 @@ test('ipsec: secrets are base64 in swanctl.conf; unsafe tokens rejected', () => 
   assert.throws(() => swanctlConf({ ...p, server: 'a b' }, { username: 'me', password: 'x' }));
   assert.throws(() => swanctlConf(p, { username: 'm"e', password: 'x' }));
 });
+
+test('a keyhop-held config is redacted line by line and argument by argument', async () => {
+  const text = 'client\nremote vpn.example.com 1194\nhttps://user:token@github.com\n';
+  const resolve: SecretResolver = async () => text;
+  const s = await stage({ type: 'openvpn', config: { keyhop: 'VPNHOP_X_CONFIG' } }, dir, resolve);
+  const values = Object.values(s.secrets);
+  assert.ok(values.includes('https://user:token@github.com'));
+  assert.ok(values.includes('vpn.example.com'));
+  assert.ok(!values.includes('remote'), 'directive names are left visible');
+});

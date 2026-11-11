@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { Config, Profile, VpnType } from './config.ts';
-import { getProfile } from './config.ts';
+import { getProfile, keyhopRefs } from './config.ts';
 import type { Docker } from './docker.ts';
-import { removeContainersSync } from './docker.ts';
 import { hostAllowed } from './hosts.ts';
+import type { Keyhop } from './keyhop.ts';
 import { redactor } from './redact.ts';
 import type { HttpRequest, HttpResponse } from './request.ts';
 import { curlArgs, parseCurl, targetUrl } from './request.ts';
@@ -20,26 +20,30 @@ export type TunnelStatus = {
   state: TunnelState;
   container: string;
   allowHosts?: string[];
-  idleDisconnectAt?: string;
+  /** When the lease runs out and the tunnel stops itself, unless used again. */
+  expiresAt?: string;
   logs?: string;
 };
+
+export type ProxyInfo = { profile: string; host: string; port: number; expiresAt: string };
 
 export type TunnelDeps = {
   docker: Docker;
   loadConfig: () => Config;
-  resolver: (config: Config) => SecretResolver;
+  resolver: (config: Config, keyhop: Record<string, string>) => SecretResolver;
+  keyhop: Keyhop;
   ensureImage: () => Promise<string>;
   sleep?: (ms: number) => Promise<void>;
 };
 
-type Live = { redact: (text: string) => string; timer?: NodeJS.Timeout; idleAt?: number };
+type Live = { redact: (text: string) => string };
 
 const LOG_TAIL = 40;
 const MAX_REDIRECTS = 10;
 export const containerName = (profile: string) => `vpnhop-${profile}`;
 
 /** Labels let a restarted server reuse a tunnel only if the profile hasn't changed. */
-function profileHash(profile: Profile, image: string): string {
+export function profileHash(profile: Profile, image: string): string {
   return createHash('sha256').update(image).update(JSON.stringify(profile)).digest('hex').slice(0, 16);
 }
 
@@ -47,6 +51,8 @@ export class Tunnels {
   readonly #deps: TunnelDeps;
   readonly #live = new Map<string, Live>();
   readonly #pending = new Map<string, Promise<TunnelStatus>>();
+  /** keyhop values fetched by this process, so a reconnect doesn't ask for Touch ID again. */
+  readonly #secrets = new Map<string, string>();
   readonly #sleep: (ms: number) => Promise<void>;
 
   constructor(deps: TunnelDeps) {
@@ -73,14 +79,15 @@ export class Tunnels {
     return redact(`${r.stdout.toString('utf8')}${r.stderr}`).trim();
   }
 
-  #touch(name: string, config: Config, profile: Profile): void {
-    const live = this.#live.get(name);
-    if (!live) return;
-    clearTimeout(live.timer);
-    const ms = (profile.idleMinutes ?? config.idleMinutes) * 60_000;
-    live.idleAt = Date.now() + ms;
-    live.timer = setTimeout(() => void this.disconnect(name).catch(() => {}), ms);
-    live.timer.unref();
+  #idleSeconds(config: Config, profile: Profile): number {
+    return (profile.idleMinutes ?? config.idleMinutes) * 60;
+  }
+
+  /** Lease expiry, read from the container (any process may have extended it). */
+  async #expiresAt(container: string, idleSeconds: number): Promise<string | undefined> {
+    const r = await this.#deps.docker(['exec', container, 'stat', '-c', '%Y', '/run/vpnhop/lease'], { timeoutMs: 20_000 });
+    const touched = Number(r.stdout.toString('utf8').trim());
+    return r.code === 0 && touched ? new Date((touched + idleSeconds) * 1000).toISOString() : undefined;
   }
 
   connect(name: string): Promise<TunnelStatus> {
@@ -99,21 +106,31 @@ export class Tunnels {
     const container = containerName(name);
     const image = await this.#deps.ensureImage();
     const hash = profileHash(profile, image);
-    const staged = await stage(profile, config.dir, this.#deps.resolver(config));
-    const redact = redactor(staged.secrets);
+    const idle = this.#idleSeconds(config, profile);
 
+    // A running tunnel for this exact profile (any process may have started it) is shared:
+    // extend its lease. No secrets needed, so no Touch ID.
     const current = await this.#inspect(container);
     if (current?.running && current.hash === hash && (await this.#isReady(container))) {
-      this.#live.set(name, { ...this.#live.get(name), redact });
-      this.#touch(name, config, profile);
-      return this.#status(name, config, profile, 'connected');
+      await docker(['exec', container, 'touch', '/run/vpnhop/lease'], { timeoutMs: 20_000 });
+      return this.#status(name, profile, 'connected', await this.#expiresAt(container, idle));
     }
     if (current) await docker(['rm', '-f', container], { timeoutMs: 30_000 });
+
+    // One keyhop call (one Touch ID) for every keyhop secret the profile uses.
+    const wanted = keyhopRefs(profile).filter((n) => !this.#secrets.has(n));
+    if (wanted.length)
+      for (const [k, v] of Object.entries(await this.#deps.keyhop.get(wanted, `Connect VPN profile "${name}"`))) this.#secrets.set(k, v);
+    const staged = await stage(profile, config.dir, this.#deps.resolver(config, Object.fromEntries(this.#secrets)));
+    const redact = redactor(staged.secrets);
 
     const create = await docker([
       'create', '--name', container,
       '--label', 'vpnhop.profile=' + name, '--label', 'vpnhop.hash=' + hash,
       '--cap-add', 'NET_ADMIN', '--device', '/dev/net/tun',
+      '-e', `VPNHOP_IDLE_SECONDS=${idle}`,
+      // SOCKS5 for other tools (vpnhop proxy); loopback only, and nothing listens until asked.
+      '-p', '127.0.0.1::1080',
       ...staged.dockerArgs,
       image, profile.type,
     ]);
@@ -134,8 +151,7 @@ export class Tunnels {
     while (Date.now() < deadline) {
       if (await this.#isReady(container)) {
         this.#live.set(name, { redact });
-        this.#touch(name, config, profile);
-        return this.#status(name, config, profile, 'connected');
+        return this.#status(name, profile, 'connected', await this.#expiresAt(container, idle));
       }
       const state = await this.#inspect(container);
       if (!state?.running) await fail(`Tunnel "${name}" exited before connecting.`);
@@ -145,15 +161,12 @@ export class Tunnels {
   }
 
   async disconnect(name: string): Promise<{ profile: string; state: 'stopped' }> {
-    const live = this.#live.get(name);
-    clearTimeout(live?.timer);
     this.#live.delete(name);
     await this.#deps.docker(['rm', '-f', containerName(name)], { timeoutMs: 30_000 });
     return { profile: name, state: 'stopped' };
   }
 
-  #status(name: string, config: Config, profile: Profile, state: TunnelState, logs?: string): TunnelStatus {
-    const idleAt = this.#live.get(name)?.idleAt;
+  #status(name: string, profile: Profile, state: TunnelState, expiresAt?: string, logs?: string): TunnelStatus {
     return {
       profile: name,
       type: profile.type,
@@ -161,7 +174,7 @@ export class Tunnels {
       state,
       container: containerName(name),
       ...(profile.allowHosts ? { allowHosts: profile.allowHosts } : {}),
-      ...(state === 'connected' && idleAt ? { idleDisconnectAt: new Date(idleAt).toISOString() } : {}),
+      ...(state === 'connected' && expiresAt ? { expiresAt } : {}),
       ...(logs ? { logs } : {}),
     };
   }
@@ -178,10 +191,11 @@ export class Tunnels {
         if (this.#pending.has(n)) state = 'connecting';
         else if (info?.running) state = (await this.#isReady(container)) ? 'connected' : 'connecting';
         else if (info) state = 'exited';
+        const expires = state === 'connected' ? await this.#expiresAt(container, this.#idleSeconds(config, profile)) : undefined;
         // Logs only when this server knows the secrets to redact them with.
         const live = this.#live.get(n);
         const text = logs && info && live ? await this.#logs(container, live.redact) : undefined;
-        return this.#status(n, config, profile, state, text);
+        return this.#status(n, profile, state, expires, text);
       })
     );
   }
@@ -191,11 +205,11 @@ export class Tunnels {
     const profile = getProfile(config, req.profile);
     let current: HttpRequest = { ...req, url: this.#allowed(targetUrl(req.url), req.profile, profile.allowHosts) };
     const container = containerName(req.profile);
-    if (!this.#live.has(req.profile) || !(await this.#isReady(container))) await this.connect(req.profile);
+    if (!(await this.#isReady(container))) await this.connect(req.profile);
     for (let hop = 0; ; hop++) {
-      this.#touch(req.profile, config, profile);
       const { args, input } = curlArgs(current);
-      const r = await this.#deps.docker(['exec', ...(input ? ['-i'] : []), container, ...args], {
+      // lease-exec.sh extends the lease, then execs curl.
+      const r = await this.#deps.docker(['exec', ...(input ? ['-i'] : []), container, '/vpnhop/lease-exec.sh', ...args], {
         input,
         timeoutMs: (current.timeoutSeconds + 15) * 1000,
         maxStdout: current.maxBodyBytes,
@@ -230,9 +244,24 @@ export class Tunnels {
     return next;
   }
 
-  /** Containers this process started; removed on exit so no tunnel outlives the server. */
-  shutdownSync(): void {
-    removeContainersSync([...this.#live.keys()].map(containerName));
+  /** The tunnel's SOCKS5 proxy for other tools (contract B): connects if needed, extends the lease. */
+  async proxy(name: string): Promise<ProxyInfo> {
+    const config = this.#deps.loadConfig();
+    const profile = getProfile(config, name);
+    const container = containerName(name);
+    await this.connect(name);
+    const socks = await this.#deps.docker(['exec', container, '/vpnhop/socks.sh'], { timeoutMs: 30_000 });
+    if (socks.code !== 0) throw new Error(`Starting the SOCKS proxy failed: ${socks.stderr.trim().slice(0, 300)}`);
+    const port = await this.#deps.docker(['port', container, '1080/tcp'], { timeoutMs: 20_000 });
+    const m = /^127\.0\.0\.1:(\d+)$/m.exec(port.stdout.toString('utf8'));
+    if (port.code !== 0 || !m) throw new Error('The tunnel has no loopback SOCKS port; disconnect and connect it again');
+    const expiresAt = (await this.#expiresAt(container, this.#idleSeconds(config, profile))) ?? new Date().toISOString();
+    return { profile: name, host: '127.0.0.1', port: Number(m[1]), expiresAt };
+  }
+
+  /** Drops what this process holds (fetched secrets, log redactors). Tunnels are shared and stay up. */
+  forget(): void {
+    this.#secrets.clear();
     this.#live.clear();
   }
 }

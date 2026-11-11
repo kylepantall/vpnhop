@@ -2,10 +2,10 @@ FROM alpine:3.24
 
 RUN apk add --no-cache \
       openvpn wireguard-tools wireguard-go openconnect vpnc strongswan \
-      curl iproute2 iptables ca-certificates \
+      curl iproute2 iptables ca-certificates dante-server \
  && mkdir -p /run/vpnhop /vpn
 
-COPY entrypoint.sh openvpn-route-up.sh openconnect-script.sh /vpnhop/
+COPY entrypoint.sh openvpn-route-up.sh openconnect-script.sh lease-exec.sh socks.sh /vpnhop/
 RUN chmod 755 /vpnhop/*.sh
 
 ENTRYPOINT ["/vpnhop/entrypoint.sh"]

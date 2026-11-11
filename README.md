@@ -10,12 +10,34 @@ Each profile's VPN client runs in its own throwaway Docker container; requests r
 | Cisco AnyConnect / ocserv, GlobalProtect, Pulse/Ivanti, Juniper NC, Fortinet, F5, Array | `openconnect` | username/password, TOTP, cert pin |
 | IPsec IKEv2 | strongSwan (`swanctl`) | EAP-MSCHAPv2, PSK |
 
+Part of a suite with [keyhop](https://github.com/kylepantall/keyhop) (the encrypted vault) and [hopsql](https://github.com/kylepantall/hopsql) (databases). See [docs/suite.md](docs/suite.md).
+
+## Save a profile once
+
+```bash
+vpnhop import                                  # lists OpenVPN Connect profiles, with the command to save each
+vpnhop add aws ~/Downloads/aws.ovpn            # any .ovpn or WireGuard .conf
+vpnhop add corp --type openconnect --server vpn.example.com --protocol gp --user me --totp
+vpnhop list
+```
+
+- The profile file and its credentials are encrypted in keyhop (Touch ID). Referenced cert/key files and an `auth-user-pass` file are inlined first.
+- `config.json` only gets names, settings and `{ "keyhop": "VPNHOP_AWS_CONFIG" }` references.
+- Missing credentials are asked for in the terminal, with the input hidden. You can then delete the original file.
+- Claude can save a profile from a file path with `save_profile`; you confirm with Touch ID. Claude never sees the contents.
+
 ## How it works
 
 - No sudo, no host routes, no system VPN. Host traffic is never affected.
-- Secrets are resolved per connect from `env`, `file` or `command` (e.g. `op read`). They are piped into the container as a tar over stdin, so there's no host temp file, env var or bind mount.
+- When a tunnel starts, vpnhop fetches all of the profile's secrets from keyhop in one request, which takes one Touch ID tap. keyhop only answers the vpnhop install it pinned.
+- Secrets can also come from `env`, `file` or `command` (e.g. `op read`).
+- Either way, secrets reach the container as a tar on stdin: no host temp file, env var or bind mount.
 - DNS is resolved inside the tunnel (pushed DNS, WireGuard `DNS=`, or `dns`/`searchDomains` overrides).
-- Tunnels connect on first `http_request` and close after `idleMinutes`, or when the server exits.
+- Tunnels are shared and leased:
+  - Every request or `vpnhop proxy` call extends the lease.
+  - The container stops itself after `idleMinutes` without use.
+  - Reusing a running tunnel needs no secrets, so no Touch ID.
+- Other tools reach the VPN through `vpnhop proxy <p>`, a SOCKS5 proxy on `127.0.0.1`. hopsql uses it with `"vpn": {"provider": "vpnhop", "profile": "aws"}`.
 - Client logs come back redacted, and only for tunnels this server started.
 
 ## Tools
@@ -25,6 +47,7 @@ Each profile's VPN client runs in its own throwaway Docker container; requests r
 | `list_profiles` | Profiles, type, allowed hosts, tunnel state |
 | `http_request` | HTTP(S) via a profile; auto-connects |
 | `connect` / `disconnect` | Manual tunnel control |
+| `save_profile` / `remove_profile` | Save a profile file into keyhop, or delete one (Touch ID) |
 | `status` | State, plus the redacted client log |
 | `refresh` | Same as `vpnhop refresh` |
 
@@ -71,15 +94,19 @@ Your config is kept. Add `-s -- --purge` to delete `~/.config/vpnhop` as well.
 | `vpnhop` / `vpnhop serve` | MCP server on stdio |
 | `vpnhop update` | Checks GitHub for a newer release and reruns the installer for it. `--check` only reports, `--yes` skips the prompt, `--json` for scripts |
 | `vpnhop refresh` | Closes and restarts dangling instances (details below). macOS and Linux |
+| `vpnhop add` / `import` / `remove` / `list [--json]` | Manage saved profiles (see above) |
+| `vpnhop proxy <p> [--json]` | SOCKS5 proxy into the tunnel for other tools; extends the lease |
+| `vpnhop keyhop-register` | Register this install with keyhop again (the installer does this) |
 | `vpnhop status` | Every profile and its tunnel state |
 | `vpnhop connect <p>` / `disconnect <p>` | Bring a tunnel up or down |
 | `vpnhop get <p> <url>` | GET a URL through a tunnel |
 | `vpnhop build` | Rebuild the runtime image |
 
 What `vpnhop refresh` does:
-- Running servers close their tunnels, which reconnect on the next call.
+- Running servers drop the secrets they cached.
 - Servers older than the installed build, or orphaned by a closed client, are stopped. Claude restarts them on reconnect.
-- Leftover tunnel containers and old runtime images are removed.
+- Tunnels that are stopped, belong to a deleted profile, or were built from an older profile or image are removed. Healthy tunnels stay up.
+- Old runtime images are removed.
 
 **Releasing:** bump `version` in `package.json` and `src/version.ts`, then publish a `v<version>` GitHub release. `vpnhop update` picks it up.
 
@@ -92,7 +119,8 @@ What `vpnhop refresh` does:
 | `allowHosts` | all | `*`, exact host, `*.suffix`, IPv4 CIDR. Omit to allow any |
 | `dns`, `searchDomains` | all | Override pushed DNS |
 | `idleMinutes`, `connectTimeoutSeconds` | all | Also settable under `defaults` |
-| secrets | all | `{ "env": "X" }`, `{ "file": "path" }`, `{ "command": ["op","read","op://…"] }`. Literal values are rejected |
+| secrets | all | `{ "keyhop": "NAME" }` (what `vpnhop add` writes), `{ "env": "X" }`, `{ "file": "path" }`, `{ "command": ["op","read","op://…"] }`. Literal values are rejected |
+| `config` | openvpn, wireguard | A file path, or `{ "keyhop": "NAME" }` holding the whole file |
 
 ⚠️ For OpenVPN, external `ca`/`cert`/`key`/`tls-*` files are copied in, and host hook scripts (`up`, `down`, …) are dropped.
 
@@ -100,13 +128,15 @@ What `vpnhop refresh` does:
 
 - SAML / browser SSO VPNs (AWS Client VPN federated auth, Okta-fronted GlobalProtect) need a human in a browser, so they can't run headless.
 - L2TP, PPTP and SSTP are not supported.
-- HTTP(S) only. There is no raw TCP or SOCKS proxy yet.
+- Claude gets HTTP(S) only. Raw TCP goes through `vpnhop proxy`.
+- ⚠️ Any local process can use a tunnel's SOCKS port while it is up.
+- ⚠️ Anything that can run `docker exec` can read a running tunnel's staged secrets. That includes Claude's shell.
 
 ## Develop
 
 ```bash
 npm install
 npm test            # unit
-npm run test:e2e    # real WireGuard, OpenVPN and IPsec servers in Docker
+npm run test:e2e    # real WireGuard, OpenVPN and IPsec servers in Docker, a fake keyhop, SOCKS and leases
 npm run typecheck
 ```
