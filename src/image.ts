@@ -5,7 +5,7 @@ import type { Docker } from './docker.ts';
 import { tar } from './tar.ts';
 
 const RUNTIME_DIR = fileURLToPath(new URL('../runtime/', import.meta.url));
-const FILES = ['Dockerfile', 'entrypoint.sh', 'openvpn-route-up.sh', 'openconnect-script.sh'] as const;
+const FILES = ['Dockerfile', 'entrypoint.sh', 'openvpn-route-up.sh', 'openconnect-script.sh', 'lease-exec.sh', 'socks.sh'] as const;
 
 function context(): { files: { name: string; data: Buffer; mode: number }[]; tag: string } {
   const hash = createHash('sha256');

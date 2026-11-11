@@ -137,6 +137,23 @@ main() {
   mv -f "$launcher" "$bin_dir/vpnhop"
   info "$bin_dir/vpnhop (version $("$bin_dir/vpnhop" --version 2>&1))"
 
+  # Saved profiles live in keyhop. It pins this install (runtime, entry, file tree), so every
+  # install or update re-registers, which asks for Touch ID once.
+  step 'keyhop (encrypted profiles)'
+  local keyhop_bin="${VPNHOP_KEYHOP_BIN:-$HOME/.local/bin/keyhop}"
+  [[ -x "$keyhop_bin" ]] || keyhop_bin="$(command -v keyhop || true)"
+  if [[ "${VPNHOP_SKIP_KEYHOP:-}" == 1 ]]; then
+    info 'Skipped (VPNHOP_SKIP_KEYHOP=1)'
+  elif [[ -n "$keyhop_bin" ]] && "$keyhop_bin" client list >/dev/null 2>&1; then
+    info 'Registering vpnhop as a keyhop client (confirm with Touch ID)'
+    if ! VPNHOP_KEYHOP_BIN="$keyhop_bin" "$bin_dir/vpnhop" keyhop-register; then
+      info 'Not registered; rerun later with: vpnhop keyhop-register'
+    fi
+  else
+    info 'keyhop 0.7+ not found: profiles still work from files and env vars, but saving them'
+    info 'encrypted needs keyhop: https://github.com/kylepantall/keyhop'
+  fi
+
   step 'Config'
   local config="${VPNHOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/vpnhop/config.json}"
   if [[ -f "$config" ]]; then

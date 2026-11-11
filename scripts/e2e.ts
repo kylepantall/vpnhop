@@ -1,8 +1,11 @@
 // End-to-end: real VPN servers in Docker, each serving HTTP only on its tunnel IP.
 // Run: node scripts/e2e.ts   (needs Docker; leaves nothing behind)
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { parseConfig } from '../src/config.ts';
+import { loadConfig } from '../src/config.ts';
+import { createKeyhop } from '../src/keyhop.ts';
+import { saveProfile } from '../src/profiles.ts';
 import { createDocker } from '../src/docker.ts';
 import { ensureImage } from '../src/image.ts';
 import { createResolver } from '../src/secrets.ts';
@@ -59,8 +62,8 @@ EOF
     mkdir -p /www/cgi-bin
     printf '#!/bin/sh\\nprintf "Status: 302 Found\\\\r\\\\nLocation: %%s\\\\r\\\\n\\\\r\\\\n" "$QUERY_STRING"\\n' > /www/cgi-bin/go && chmod 755 /www/cgi-bin/go
     wg-quick up wg0 && ${httpd('10.99.0.1', 'hello over wireguard')}`);
-  writeFileSync(`${dir}wg.conf`, `[Interface]\nAddress = 10.99.0.2/32\nDNS = 10.99.0.1, e2e.internal\n[Peer]\nPublicKey = ${await wgPub(sk)}\nEndpoint = ${wgIp}:51820\nAllowedIPs = 10.99.0.0/24\nPersistentKeepalive = 5\n`);
-  writeFileSync(`${dir}wg.key`, `${ck}\n`);
+  // A complete wg-quick file, saved into (fake) keyhop by saveProfile below.
+  writeFileSync(`${dir}wg.conf`, `[Interface]\nPrivateKey = ${ck}\nAddress = 10.99.0.2/32\nDNS = 10.99.0.1, e2e.internal\n[Peer]\nPublicKey = ${await wgPub(sk)}\nEndpoint = ${wgIp}:51820\nAllowedIPs = 10.99.0.0/24\nPersistentKeepalive = 5\n`);
 
   // --- OpenVPN (certs + username/password) ------------------------------------
   const ovpnIp = await server('ovpn', image, `
@@ -122,18 +125,45 @@ EOF
     swanctl --load-all >/dev/null && ${httpd('10.97.1.1', 'hello over ipsec')}`);
   const ikeIp = await sh(['inspect', '-f', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', 'vpnhopsrv-ike']);
 
+  // Stand-in for keyhop's client interface (contract A): a JSON file, and a log of calls.
+  const store = `${dir}keyhop-store.json`;
+  writeFileSync(store, '{}');
+  writeFileSync(`${dir}fake-keyhop.cjs`, `#!/usr/bin/env node
+const fs = require('fs');
+const [, , group, sub] = process.argv;
+const req = JSON.parse(fs.readFileSync(0, 'utf8'));
+const db = JSON.parse(fs.readFileSync(${JSON.stringify(store)}, 'utf8'));
+fs.appendFileSync(${JSON.stringify(`${dir}keyhop-calls.log`)}, sub + ' ' + (req.names || Object.keys(req.values || {})).join(',') + '\\n');
+if (group !== 'client' || req.client !== 'vpnhop') process.exit(3);
+if (sub === 'get') {
+  const missing = req.names.filter((n) => !(n in db));
+  if (missing.length) { console.error('unknown: ' + missing.join(',')); process.exit(5); }
+  console.log(JSON.stringify({ values: Object.fromEntries(req.names.map((n) => [n, db[n]])) }));
+} else if (sub === 'put') {
+  if ([...Object.keys(req.values), ...req.remove].some((n) => !n.startsWith('VPNHOP_'))) process.exit(3);
+  Object.assign(db, req.values); for (const n of req.remove) delete db[n];
+  fs.writeFileSync(${JSON.stringify(store)}, JSON.stringify(db));
+  console.log(JSON.stringify({ saved: Object.keys(req.values), removed: req.remove }));
+} else process.exit(1);
+`);
+  chmodSync(`${dir}fake-keyhop.cjs`, 0o755);
+  process.env.VPNHOP_KEYHOP_BIN = `${dir}fake-keyhop.cjs`;
+  const keyhopCalls = () => readFileSync(`${dir}keyhop-calls.log`, 'utf8').split('\n').filter((l) => l.startsWith('get ')).length;
+
   const configText = JSON.stringify({
     defaults: { idleMinutes: 5, connectTimeoutSeconds: 45 },
     profiles: {
-      'e2e-wg': { type: 'wireguard', config: 'wg.conf', privateKey: { file: 'wg.key' }, allowHosts: ['10.99.0.0/24'] },
       'e2e-ovpn': { type: 'openvpn', config: 'ovpn/client.ovpn', username: { env: 'E2E_OVPN_USER' }, password: { file: 'ovpn-pass.txt' } },
-      'e2e-ike': { type: 'ipsec', server: ikeIp, auth: 'psk', username: { env: 'E2E_IKE_ID' }, psk: { command: ['printf', 'e2e-psk-value'] }, remoteId: 'server.e2e', subnets: ['10.97.1.0/24'] },
+      'e2e-ike': { type: 'ipsec', server: ikeIp, auth: 'psk', username: { env: 'E2E_IKE_ID' }, psk: { command: ['printf', 'e2e-psk-value'] }, remoteId: 'server.e2e', subnets: ['10.97.1.0/24'], idleMinutes: 1 },
     },
   });
-  writeFileSync(`${dir}config.json`, configText);
-  const config = parseConfig(configText, `${dir}config.json`);
+  const configFile = `${dir}config.json`;
+  writeFileSync(configFile, configText);
+  const keyhop = createKeyhop();
+  await saveProfile(keyhop, { name: 'e2e-wg', file: `${dir}wg.conf`, allowHosts: ['10.99.0.0/24'] }, configFile);
+  const config = loadConfig(configFile);
   const env = { ...process.env, E2E_OVPN_USER: 'e2e-user', E2E_IKE_ID: 'client.e2e' };
-  const tunnels = new Tunnels({ docker, loadConfig: () => config, resolver: (c) => createResolver(c.dir, env), ensureImage: async () => image });
+  const tunnels = new Tunnels({ docker, keyhop, loadConfig: () => loadConfig(configFile), resolver: (c, v) => createResolver(c.dir, env, v), ensureImage: async () => image });
 
   const check = async (label: string, fn: () => Promise<string | void>) => {
     try {
@@ -198,7 +228,7 @@ EOF
     writeFileSync(`${dir}ovpn-pass.txt`, 'wrong\n');
     await tunnels.disconnect('e2e-ovpn');
     const fast = { ...config, profiles: { ...config.profiles, 'e2e-ovpn': { ...config.profiles['e2e-ovpn']!, connectTimeoutSeconds: 15 } } };
-    const t = new Tunnels({ docker, loadConfig: () => fast, resolver: (c) => createResolver(c.dir, env), ensureImage: async () => image });
+    const t = new Tunnels({ docker, keyhop, loadConfig: () => fast, resolver: (c, v) => createResolver(c.dir, env, v), ensureImage: async () => image });
     try {
       await t.connect('e2e-ovpn');
     } catch (e) {
@@ -215,6 +245,36 @@ EOF
     const before = await sh(['inspect', '-f', '{{.Id}}', 'vpnhop-e2e-wg']);
     await tunnels.connect('e2e-wg');
     if ((await sh(['inspect', '-f', '{{.Id}}', 'vpnhop-e2e-wg'])) !== before) throw new Error('container was recreated');
+  });
+  await check('keyhop: saved profile stores no secret in config.json', async () => {
+    const text = readFileSync(configFile, 'utf8');
+    if (text.includes(ck) || !/"keyhop": "VPNHOP_E2E_WG_CONFIG"/.test(text)) throw new Error(text);
+  });
+  await check('keyhop: one Touch ID (get) for the first connect, none for reuse', async () => {
+    const before = keyhopCalls();
+    await tunnels.connect('e2e-wg');
+    const t2 = new Tunnels({ docker, keyhop, loadConfig: () => loadConfig(configFile), resolver: (c, v) => createResolver(c.dir, env, v), ensureImage: async () => image });
+    await t2.connect('e2e-wg'); // another process sharing the running tunnel
+    if (before !== 1 || keyhopCalls() !== 1) throw new Error(`keyhop get calls: ${before} then ${keyhopCalls()}`);
+  });
+  await check('proxy: vpnhop proxy --json gives a SOCKS5 proxy into the tunnel', async () => {
+    const out = execFileSync(process.execPath, [fileURLToPath(new URL('../src/index.ts', import.meta.url)), 'proxy', 'e2e-wg', '--json'], {
+      env: { ...process.env, VPNHOP_CONFIG: configFile },
+      encoding: 'utf8',
+    });
+    const info = JSON.parse(out) as { host: string; port: number; expiresAt: string; profile: string };
+    if (info.host !== '127.0.0.1' || !info.port || info.profile !== 'e2e-wg' || !(Date.parse(info.expiresAt) > Date.now())) throw new Error(out);
+    const body = execFileSync('curl', ['-sS', '--max-time', '10', '--socks5-hostname', `127.0.0.1:${info.port}`, 'http://10.99.0.1:8080/hello'], { encoding: 'utf8' });
+    if (body.trim() !== 'hello over wireguard') throw new Error(body);
+    return `port ${info.port}`;
+  });
+  await check('lease: an idle tunnel stops itself (idleMinutes 1)', async () => {
+    for (let i = 0; i < 120; i++) {
+      const r = await docker(['inspect', '-f', '{{.State.Running}}', 'vpnhop-e2e-ike']);
+      if (r.stdout.toString().trim() === 'false') return `stopped after ≈${i}s more`;
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    throw new Error('still running 120s after its 60s lease');
   });
   await check('disconnect removes containers', async () => {
     for (const p of ['e2e-wg', 'e2e-ovpn', 'e2e-ike']) await tunnels.disconnect(p);
