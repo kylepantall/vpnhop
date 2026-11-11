@@ -1,0 +1,35 @@
+{
+  "defaults": { "idleMinutes": 30, "connectTimeoutSeconds": 60 },
+  "profiles": {
+    "aws": {
+      "type": "openvpn",
+      "description": "AWS Client VPN, cert auth",
+      "config": "~/Library/Application Support/OpenVPN Connect/profiles/<profile-id>.ovpn",
+      "allowHosts": ["*.internal", "10.0.0.0/8"]
+    },
+    "office": {
+      "type": "wireguard",
+      "config": "~/vpn/office.conf",
+      "privateKey": { "command": ["op", "read", "op://Work/Office WireGuard/private key"] }
+    },
+    "corp": {
+      "type": "openconnect",
+      "protocol": "anyconnect",
+      "server": "vpn.example.com",
+      "username": { "env": "CORP_VPN_USER" },
+      "password": { "command": ["op", "read", "op://Work/Corp VPN/password"] },
+      "totpSecret": { "command": ["op", "read", "op://Work/Corp VPN/totp seed"] },
+      "serverCert": "pin-sha256:REPLACE_ME"
+    },
+    "datacentre": {
+      "type": "ipsec",
+      "server": "ike.example.com",
+      "auth": "eap",
+      "username": { "env": "DC_VPN_USER" },
+      "password": { "file": "~/.config/vpnhop/dc-password" },
+      "subnets": ["10.20.0.0/16"],
+      "dns": ["10.20.0.2"],
+      "searchDomains": ["dc.example.com"]
+    }
+  }
+}
