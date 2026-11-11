@@ -100,3 +100,34 @@ test('removeProfile leaves keyhop secrets it does not own', async () => {
   assert.equal(k.db.CORP_VPN_PASSWORD, 'synced-from-1password');
   assert.equal(keyhopName('my-vpn', 'totp'), 'VPNHOP_MY_VPN_TOTP');
 });
+
+test('save_profile refuses files that are not the VPN config they claim to be', () => {
+  writeFileSync(join(dir, 'creds'), 'https://user:token@github.com\n');
+  assert.throws(() => planAdd({ name: 'git', file: join(dir, 'creds'), type: 'openvpn' }));
+  assert.throws(() => planAdd({ name: 'git', file: join(dir, 'creds'), type: 'wireguard' }));
+  writeFileSync(join(dir, 'half.conf'), '[Interface]\nPrivateKey = k\n');
+  assert.throws(() => planAdd({ name: 'w', file: join(dir, 'half.conf') }));
+});
+
+test('read errors for referenced files carry no path from the profile text', () => {
+  writeFileSync(join(dir, 'missing.ovpn'), 'client\nremote vpn.example.com\nkey sk_live_secretish_name\n');
+  const err = (() => {
+    try {
+      planAdd({ name: 'm', file: join(dir, 'missing.ovpn') });
+    } catch (e) {
+      return e as Error;
+    }
+  })();
+  assert.ok(err && !err.message.includes('sk_live_secretish_name'));
+});
+
+test('profiles differing only by - and _ are refused (they would share keyhop names)', async () => {
+  const cfg = join(dir, 'clash.json');
+  const k = fakeKeyhop();
+  await saveProfile(k, { name: 'aws-prod', file: join(dir, 'w.ovpn') }, cfg);
+  const before = { ...k.db };
+  await assert.rejects(saveProfile(k, { name: 'aws_prod', file: join(dir, 'w.ovpn') }, cfg));
+  assert.deepEqual(k.db, before, 'nothing written to keyhop');
+  const { parseConfig } = await import('../src/config.ts');
+  assert.throws(() => parseConfig(JSON.stringify({ profiles: { 'a-b': { type: 'openvpn', config: 'x' }, a_b: { type: 'openvpn', config: 'y' } } }), '/c.json'));
+});

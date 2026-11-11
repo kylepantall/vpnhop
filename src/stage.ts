@@ -154,6 +154,12 @@ async function profileText(source: ConfigSource, baseDir: string, what: string, 
   }
   const text = await resolve(source, what);
   secrets[what] = text;
+  // VPN clients echo config lines in parse errors, so redact each line, and each argument
+  // (not the directive name, which logs mention harmlessly), on its own.
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length >= 8);
+  lines.forEach((line, i) => (secrets[`${what} line ${i + 1}`] = line));
+  const args = new Set(lines.flatMap((l) => l.split(/\s+/).slice(1)).filter((t) => t.length >= 8));
+  [...args].forEach((arg, i) => (secrets[`${what} value ${i + 1}`] = arg));
   return { text };
 }
 

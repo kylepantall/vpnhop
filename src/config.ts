@@ -105,7 +105,17 @@ export const ConfigFile = z
     defaults: z.object({ idleMinutes: common.idleMinutes, connectTimeoutSeconds: common.connectTimeoutSeconds }).optional(),
     profiles: z.record(z.string().regex(PROFILE_NAME, 'lowercase letters, digits, - and _'), Profile),
   })
-  .strict();
+  .strict()
+  .superRefine((c, ctx) => {
+    // aws-prod and aws_prod would read and overwrite each other's keyhop secrets.
+    const seen = new Map<string, string>();
+    for (const name of Object.keys(c.profiles)) {
+      const key = name.replace(/-/g, '_');
+      const other = seen.get(key);
+      if (other) ctx.addIssue({ code: 'custom', message: `profiles "${other}" and "${name}" differ only by - and _` });
+      seen.set(key, name);
+    }
+  });
 
 export type Config = { path: string; dir: string; profiles: Record<string, Profile>; idleMinutes: number; connectTimeoutSeconds: number };
 

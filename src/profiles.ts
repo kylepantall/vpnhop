@@ -20,7 +20,16 @@ export type InlinedOvpn = { text: string; username?: string; password?: string; 
  * Makes an .ovpn self-contained: referenced cert/key files become inline blocks, and an
  * `auth-user-pass <file>` becomes bare `auth-user-pass` with its credentials returned separately.
  */
-export function inlineOvpn(text: string, dir: string, read: (path: string) => Buffer = (p) => readFileSync(p)): InlinedOvpn {
+const readReferenced = (path: string, directive: string): Buffer => {
+  try {
+    return readFileSync(path);
+  } catch {
+    // No path in the message: it comes from the profile's own text.
+    throw new Error(`The file the profile's "${directive}" line refers to can't be read`);
+  }
+};
+
+export function inlineOvpn(text: string, dir: string, read: (path: string, directive: string) => Buffer = readReferenced): InlinedOvpn {
   const out: string[] = [];
   let block: string | undefined;
   let auth = false;
@@ -47,7 +56,7 @@ export function inlineOvpn(text: string, dir: string, read: (path: string) => Bu
     if (directive === 'auth-user-pass') {
       auth = true;
       if (arg && arg !== 'stdin') {
-        const [u, p] = read(resolvePath(arg, dir)).toString('utf8').split(/\r?\n/);
+        const [u, p] = read(resolvePath(arg, dir), directive).toString('utf8').split(/\r?\n/);
         username = u || undefined;
         password = p || undefined;
       }
@@ -55,7 +64,7 @@ export function inlineOvpn(text: string, dir: string, read: (path: string) => Bu
       continue;
     }
     if (directive && arg && arg !== '[inline]' && INLINE.has(directive)) {
-      const data = read(resolvePath(arg, dir));
+      const data = read(resolvePath(arg, dir), directive);
       const body = BINARY.has(directive) ? data.toString('base64').replace(/(.{64})/g, '$1\n') : data.toString('utf8');
       out.push(`<${directive}>`, body.replace(/\n$/, ''), `</${directive}>`);
       // tls-auth's direction argument becomes key-direction when inlined.
@@ -88,6 +97,14 @@ export type AddRequest = {
   psk?: string;
 };
 
+/** Refuses files that aren't the VPN config they claim to be, so save_profile can't store arbitrary files. */
+export function assertLooksLike(type: Profile['type'], text: string): void {
+  if (type === 'wireguard' && !(/^\s*\[Interface\]\s*$/im.test(text) && /^\s*\[Peer\]\s*$/im.test(text)))
+    throw new Error('Not a WireGuard config: it needs [Interface] and [Peer] sections');
+  if (type === 'openvpn' && !/^\s*remote\s+\S+/m.test(text))
+    throw new Error('Not an OpenVPN client profile: it has no "remote" line');
+}
+
 export function detectType(text: string, file: string): Profile['type'] {
   if (/^\s*\[Interface\]\s*$/im.test(text)) return 'wireguard';
   if (/\.ovpn$/i.test(file) || /^\s*(client|remote)\b/m.test(text)) return 'openvpn';
@@ -110,9 +127,11 @@ export function planAdd(req: AddRequest): { profile: Record<string, unknown>; va
   const needs: ('username' | 'password')[] = [];
 
   if (req.file) {
-    const path = resolvePath(req.file, process.cwd());
+    // The launcher starts vpnhop in its own folder and passes the caller's as VPNHOP_CWD.
+    const path = resolvePath(req.file, process.env.VPNHOP_CWD ?? process.cwd());
     const raw = readFileSync(path, 'utf8');
     const type = req.type ?? detectType(raw, path);
+    assertLooksLike(type, raw);
     if (type === 'openvpn') {
       const ovpn = inlineOvpn(raw, dirname(path));
       const username = req.username ?? ovpn.username;
@@ -176,6 +195,14 @@ export function planAdd(req: AddRequest): { profile: Record<string, unknown>; va
 /** Saves secrets to keyhop first, then the profile; an old profile's leftover keyhop names are removed. */
 export async function saveProfile(keyhop: Keyhop, req: AddRequest, path = configPath()): Promise<{ profile: string; type: string; keyhop: string[] }> {
   const { profile, values, needs } = planAdd(req);
+  let existing: string[] = [];
+  try {
+    existing = Object.keys(loadConfig(path).profiles);
+  } catch {
+    // No config yet.
+  }
+  const clash = existing.find((other) => other !== req.name && keyhopName(other, '') === keyhopName(req.name, ''));
+  if (clash) throw new Error(`"${req.name}" would share keyhop secrets with profile "${clash}"; pick another name`);
   if (needs.length) throw new Error(`Profile "${req.name}" needs ${needs.join(' and ')}; run vpnhop add in a terminal to be asked for them`);
   let previous: string[] = [];
   try {
@@ -185,7 +212,8 @@ export async function saveProfile(keyhop: Keyhop, req: AddRequest, path = config
     // No config yet.
   }
   const stale = previous.filter((n) => !(n in values) && n.startsWith(keyhopName(req.name, '')));
-  await keyhop.put(values, stale, `Save VPN profile "${req.name}"`);
+  const from = req.file ? ` from ${resolvePath(req.file, process.env.VPNHOP_CWD ?? process.cwd())}` : '';
+  await keyhop.put(values, stale, `Save VPN profile "${req.name}"${from}`);
   editConfig((raw) => {
     raw.profiles![req.name] = profile as never;
   }, path);

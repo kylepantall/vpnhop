@@ -132,9 +132,12 @@ main() {
   {
     printf '#!/usr/bin/env bash\n'
     printf 'export VPNHOP_LAUNCHER=%q\n' "$bin_dir/vpnhop"
-    # Variables that inject code into node; keyhop refuses to serve a client that has them.
-    printf 'unset NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE LD_PRELOAD\n'
-    printf 'for v in $(env | sed -n "s/^\\(DYLD_[A-Z_]*\\)=.*/\\1/p"); do unset "$v"; done\n'
+    # Runtime and loader variables can inject code; keyhop refuses to serve a client that has them.
+    printf 'for v in $(env | sed -nE "s/^((NODE|BUN|DYLD|LD)_[A-Za-z0-9_]*)=.*/\\1/p"); do unset "$v"; done\n'
+    # Start in our own folder (keyhop requires it: runtimes read config from the working folder)
+    # and pass the caller's folder on, for relative paths like `vpnhop add ./work.ovpn`.
+    printf 'export VPNHOP_CWD="$PWD"\n'
+    printf 'cd %q || exit 1\n' "$install_dir/app"
     printf 'exec %q %q "$@"\n' "$node_bin" "$install_dir/app/src/index.ts"
   } > "$launcher"
   chmod +x "$launcher"
