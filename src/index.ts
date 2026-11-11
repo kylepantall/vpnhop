@@ -3,6 +3,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { loadConfig } from './config.ts';
 import { createDocker } from './docker.ts';
 import { ensureImage } from './image.ts';
+import { refresh, runRefresh } from './refresh.ts';
+import { runUpdateCommand } from './update.ts';
 import { createResolver } from './secrets.ts';
 import { createServer } from './server.ts';
 import { Tunnels } from './tunnels.ts';
@@ -15,6 +17,8 @@ const USAGE = `vpnhop ${VERSION}
   vpnhop connect <profile>       bring a tunnel up
   vpnhop disconnect <profile>    take it down
   vpnhop get <profile> <url>     GET a URL through the tunnel
+  vpnhop refresh                 recycle running servers, stop stale/orphaned ones, remove dangling tunnels
+  vpnhop update [--check] [--yes] [--json]   install the latest GitHub release
 Config: $VPNHOP_CONFIG or ~/.config/vpnhop/config.json`;
 
 const docker = createDocker();
@@ -29,15 +33,22 @@ const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
 
 async function main(argv: string[]): Promise<void> {
   const [command = 'serve', a, b] = argv;
+  const rest = argv.slice(1);
   switch (command) {
     case 'serve': {
       const exit = () => {
         tunnels.shutdownSync();
         process.exit(0);
       };
-      process.on('SIGINT', exit).on('SIGTERM', exit).on('SIGHUP', exit);
+      process.on('SIGINT', exit).on('SIGTERM', exit);
+      // `vpnhop refresh` recycles current servers: drop tunnels, reconnect on the next call.
+      process.on('SIGHUP', () => tunnels.shutdownSync());
       process.stdin.on('close', exit);
-      await createServer(tunnels, () => loadConfig()).connect(new StdioServerTransport());
+      const onRefresh = async () => {
+        tunnels.shutdownSync();
+        return refresh(docker);
+      };
+      await createServer(tunnels, () => loadConfig(), onRefresh).connect(new StdioServerTransport());
       return;
     }
     case 'build':
@@ -58,6 +69,10 @@ async function main(argv: string[]): Promise<void> {
       });
       return print(r);
     }
+    case 'refresh':
+      return runRefresh(docker, rest);
+    case 'update':
+      return runUpdateCommand(rest, VERSION);
     case '-v':
     case '--version':
       return console.log(VERSION);

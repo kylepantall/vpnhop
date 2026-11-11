@@ -26,20 +26,62 @@ Each profile's VPN client runs in its own throwaway Docker container; requests r
 | `http_request` | HTTP(S) via a profile; auto-connects |
 | `connect` / `disconnect` | Manual tunnel control |
 | `status` | State, plus the redacted client log |
+| `refresh` | Same as `vpnhop refresh` |
 
-## Setup
+## Install
 
-Needs Docker Desktop and Node ≥ 24.
+Needs Docker Desktop (running) and Node.js 24+. One command installs and registers it with Claude Code:
 
 ```bash
-cd ~/Code/vpnhop && npm install
-mkdir -p ~/.config/vpnhop && cp examples/config.json ~/.config/vpnhop/config.json   # then edit
-claude mcp add vpnhop -s user -- node ~/Code/vpnhop/src/index.ts serve
+curl -fsSL https://raw.githubusercontent.com/kylepantall/vpnhop/main/scripts/install.sh | bash -s -- --claude
 ```
 
-The first connect builds the `vpnhop-runtime` image (about 30s).
+What the installer does:
+- Installs into `~/.local/share/vpnhop`, with a `vpnhop` launcher in `~/.local/bin`. The launcher uses the Node it found at install time.
+- Builds the VPN runtime image.
+- Creates `~/.config/vpnhop/config.json` from the example if you don't have one. Edit it to add your VPNs.
+- Starts the new version: servers on the old build are stopped, and Claude starts the new one when it reconnects.
 
-CLI for debugging: `node src/index.ts status | connect <p> | disconnect <p> | get <p> <url> | build`.
+Options:
+- Pin a branch, tag or commit: `bash -s -- --claude <ref>`.
+- An existing `vpnhop` entry stops the installer. `--force` replaces it.
+- From a local checkout: `VPNHOP_SOURCE_DIR=~/Code/vpnhop bash scripts/install.sh --claude`.
+- `VPNHOP_INSTALL_DIR` and `VPNHOP_BIN_DIR` choose other directories.
+
+Start a new Claude session after installing.
+
+## Uninstall
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kylepantall/vpnhop/main/scripts/uninstall.sh | bash
+```
+
+This removes:
+- the Claude entry;
+- running servers;
+- tunnel containers and runtime images;
+- the launcher and the install directory.
+
+Your config is kept. Add `-s -- --purge` to delete `~/.config/vpnhop` as well.
+
+## Command line
+
+| Command | Does |
+|---|---|
+| `vpnhop` / `vpnhop serve` | MCP server on stdio |
+| `vpnhop update` | Checks GitHub for a newer release and reruns the installer for it. `--check` only reports, `--yes` skips the prompt, `--json` for scripts |
+| `vpnhop refresh` | Closes and restarts dangling instances (details below). macOS and Linux |
+| `vpnhop status` | Every profile and its tunnel state |
+| `vpnhop connect <p>` / `disconnect <p>` | Bring a tunnel up or down |
+| `vpnhop get <p> <url>` | GET a URL through a tunnel |
+| `vpnhop build` | Rebuild the runtime image |
+
+What `vpnhop refresh` does:
+- Running servers close their tunnels, which reconnect on the next call.
+- Servers older than the installed build, or orphaned by a closed client, are stopped. Claude restarts them on reconnect.
+- Leftover tunnel containers and old runtime images are removed.
+
+**Releasing:** bump `version` in `package.json` and `src/version.ts`, then publish a `v<version>` GitHub release. `vpnhop update` picks it up.
 
 ## Config
 
@@ -60,9 +102,10 @@ CLI for debugging: `node src/index.ts status | connect <p> | disconnect <p> | ge
 - L2TP, PPTP and SSTP are not supported.
 - HTTP(S) only. There is no raw TCP or SOCKS proxy yet.
 
-## Tests
+## Develop
 
 ```bash
+npm install
 npm test            # unit
 npm run test:e2e    # real WireGuard, OpenVPN and IPsec servers in Docker
 npm run typecheck

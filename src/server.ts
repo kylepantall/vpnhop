@@ -17,7 +17,7 @@ async function respond(work: () => Promise<unknown>): Promise<ToolResult> {
 
 const profileName = z.string().min(1).describe('Profile name from list_profiles.');
 
-export function createServer(tunnels: Tunnels, loadConfig: () => Config): McpServer {
+export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefresh?: () => Promise<unknown>): McpServer {
   const server = new McpServer(
     { name: 'vpnhop', version: VERSION },
     {
@@ -96,6 +96,21 @@ export function createServer(tunnels: Tunnels, loadConfig: () => Config): McpSer
     },
     (input) => respond(() => tunnels.request(input))
   );
+
+  if (onRefresh)
+    server.registerTool(
+      'refresh',
+      {
+        title: 'Refresh vpnhop',
+        description:
+          'Closes every tunnel (they reconnect on the next call), recycles other running vpnhop servers, ' +
+          'stops outdated or orphaned ones, and removes dangling tunnel containers and old runtime images. ' +
+          'Use after a tunnel gets stuck or after updating vpnhop.',
+        inputSchema: {},
+        annotations: { destructiveHint: false, idempotentHint: true },
+      },
+      () => respond(onRefresh)
+    );
 
   return server;
 }
