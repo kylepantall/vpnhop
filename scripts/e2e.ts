@@ -276,6 +276,14 @@ if (sub === 'get') {
     }
     throw new Error('still running 120s after its 60s lease');
   });
+  // VPNHOP_E2E_HOLD=1: keep everything up for cross-repo checks (hopsql) until SIGTERM.
+  if (process.env.VPNHOP_E2E_HOLD === '1') {
+    console.log(`HOLD config=${configFile} keyhop=${process.env.VPNHOP_KEYHOP_BIN}`);
+    // A pending promise alone doesn't keep Node alive; the interval does.
+    const keepAlive = setInterval(() => {}, 1 << 30);
+    await new Promise((resolve) => process.once('SIGTERM', resolve));
+    clearInterval(keepAlive);
+  }
   await check('disconnect removes containers', async () => {
     for (const p of ['e2e-wg', 'e2e-ovpn', 'e2e-ike']) await tunnels.disconnect(p);
     const left = await sh(['ps', '-a', '--filter', 'label=vpnhop.profile', '--format', '{{.Names}}']);
