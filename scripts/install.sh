@@ -110,7 +110,8 @@ main() {
   fi
 
   step 'Installing dependencies'
-  (cd "$staging" && PATH="$(dirname "$node_bin"):$PATH" quiet "$npm_bin" ci --omit=dev --ignore-scripts --no-audit --no-fund)
+  # --no-bin-links: keyhop refuses symlinks in a client's tree (node_modules/.bin).
+  (cd "$staging" && PATH="$(dirname "$node_bin"):$PATH" quiet "$npm_bin" ci --omit=dev --ignore-scripts --no-audit --no-fund --no-bin-links)
   info 'Done'
 
   step 'Building the VPN runtime image'
@@ -131,6 +132,9 @@ main() {
   {
     printf '#!/usr/bin/env bash\n'
     printf 'export VPNHOP_LAUNCHER=%q\n' "$bin_dir/vpnhop"
+    # Variables that inject code into node; keyhop refuses to serve a client that has them.
+    printf 'unset NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE LD_PRELOAD\n'
+    printf 'for v in $(env | sed -n "s/^\\(DYLD_[A-Z_]*\\)=.*/\\1/p"); do unset "$v"; done\n'
     printf 'exec %q %q "$@"\n' "$node_bin" "$install_dir/app/src/index.ts"
   } > "$launcher"
   chmod +x "$launcher"
