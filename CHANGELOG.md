@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- Use `session_profile` to prepare a VPNHop profile for a Keyhop plan. Approved HTTP requests use the same authenticated session as the other plan steps.
+- Planned requests check the exact profile and approved credential names, enforce the host allowlist, verify TLS, and return redirects for review.
+- Install Keyhop 0.10.0 or later and register the updated VPNHop install to use mixed plans.
+
 ## 0.2.0
 
 - **Saved profiles, encrypted in keyhop.**
