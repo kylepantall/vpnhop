@@ -5,6 +5,7 @@ import { PROFILE_NAME } from './config.ts';
 import type { Keyhop } from './keyhop.ts';
 import { removeProfile, saveProfile } from './profiles.ts';
 import { RequestInput } from './request.ts';
+import { sessionProfile } from './session.ts';
 import type { Tunnels } from './tunnels.ts';
 import { VERSION } from './version.ts';
 
@@ -30,8 +31,22 @@ export function createServer(tunnels: Tunnels, loadConfig: () => Config, onRefre
         'inside its own Docker container. Call list_profiles, then http_request with a profile: it connects ' +
         'on demand, resolves DNS inside the tunnel, and stops after the profile is idle. Profiles are ' +
         'saved encrypted in keyhop (save_profile takes a file path; the user confirms with Touch ID). VPN ' +
-        'credentials are never shown. Some profiles only allow certain hosts (allowHosts).',
+        'credentials are never shown. Some profiles only allow certain hosts (allowHosts). For a Keyhop plan, ' +
+        'call session_profile and copy its profileHash and secretNames into the vpn_http step in Keyhop open_session.',
     }
+  );
+
+  server.registerTool(
+    'session_profile',
+    {
+      title: 'Prepare a VPN profile for a Keyhop plan',
+      description:
+        'Returns the profile fingerprint and secret names for a vpn_http step in Keyhop open_session. ' +
+        'It does not start the VPN, unlock the vault or return secret values.',
+      inputSchema: { profile: profileName },
+      annotations: { readOnlyHint: true },
+    },
+    ({ profile }) => respond(async () => sessionProfile(loadConfig(), profile))
   );
 
   server.registerTool(
