@@ -52,7 +52,7 @@ function resolvConf(profile: Profile): string | undefined {
 
 export async function rewriteOvpn(
   text: string,
-  configDir: string
+  configDir?: string
 ): Promise<{ config: string; files: TarEntry[] }> {
   const files = new Map<string, Buffer>();
   const out: string[] = [];
@@ -82,6 +82,7 @@ export async function rewriteOvpn(
     }
     const arg = m[3] ?? m[4];
     if (OVPN_FILE_DIRECTIVES.has(directive) && arg && arg !== '[inline]' && arg !== 'stdin') {
+      if (configDir === undefined) throw new Error(`Keyhop-backed OpenVPN profiles must inline ${directive}. Import again with vpnhop add.`);
       const name = basename(arg);
       if (!files.has(name)) files.set(name, await readProfileFile(arg, configDir, `openvpn ${directive}`));
       out.push(`${m[1]}${directive} ${name}${m[5] ?? ''}`);
@@ -163,7 +164,9 @@ async function profileText(source: ConfigSource, baseDir: string, what: string, 
   return { text };
 }
 
-export async function stage(profile: Profile, baseDir: string, resolve: SecretResolver): Promise<Staged> {
+export async function stage(
+  profile: Profile, baseDir: string, resolve: SecretResolver, { requireSelfContained = false } = {}
+): Promise<Staged> {
   const secrets: Record<string, string> = {};
   const get = async (ref: SecretRef | undefined, label: string) => {
     if (!ref) return undefined;
@@ -180,7 +183,7 @@ export async function stage(profile: Profile, baseDir: string, resolve: SecretRe
     case 'openvpn': {
       const { text, dir } = await profileText(profile.config, baseDir, 'openvpn config', resolve, secrets);
       // A keyhop-held profile is self-contained (vpnhop add inlines its files); `dir` only exists on disk.
-      const { config, files } = await rewriteOvpn(text, dir ?? '/nonexistent');
+      const { config, files } = await rewriteOvpn(text, dir ?? (requireSelfContained ? undefined : '/nonexistent'));
       entries.push({ name: 'vpn/files', dir: true, mode: 0o700 }, ...files, { name: 'vpn/config.ovpn', data: config });
       const username = await get(profile.username, 'username');
       const password = await get(profile.password, 'password');

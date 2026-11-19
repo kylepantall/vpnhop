@@ -13,6 +13,7 @@ import { ask } from './prompt.ts';
 import { refresh, runRefresh } from './refresh.ts';
 import { createResolver } from './secrets.ts';
 import { createServer } from './server.ts';
+import { readSessionCall, runSessionRequest } from './session.ts';
 import { Tunnels } from './tunnels.ts';
 import { runUpdateCommand } from './update.ts';
 import { VERSION } from './version.ts';
@@ -137,6 +138,20 @@ async function main(argv: string[]): Promise<void> {
   const [command = 'serve', ...rest] = argv;
   const [a, b] = rest;
   switch (command) {
+    case 'keyhop-session-v1': {
+      const result = await runSessionRequest(loadConfig(), await readSessionCall(), (config, approved, request) => {
+        const sessionTunnels = new Tunnels({
+          docker,
+          keyhop: approved,
+          loadConfig: () => config,
+          resolver: (cfg, values) => createResolver(cfg.dir, process.env, values),
+          ensureImage: () => ensureImage(docker),
+          requireSelfContained: true,
+        });
+        return sessionTunnels.request(request, { verifyProfile: true });
+      });
+      return print(result);
+    }
     case 'serve': {
       const exit = () => process.exit(0);
       // Tunnels are shared and leased; nothing to tear down on exit.

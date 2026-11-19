@@ -2,6 +2,8 @@
 
 Save a VPN profile once, encrypted. Use it from vpnhop (HTTP from Claude) and hopsql (databases behind the VPN), with a Touch ID tap when a tunnel starts.
 
+For several approved operations, Keyhop also supports an ordered session. VPNHop's `session_profile` MCP tool supplies the profile hash and credential names. Keyhop verifies the registered VPNHop install before launching its `keyhop-session-v1` entry point. A single JSON request on stdin contains the approved request, profile hash, and credential values for that profile. VPNHop checks them against a local config snapshot and runs the usual tunnel request with TLS verification, the profile's host allowlist, and redirects disabled. It returns only the HTTP result.
+
 | Tool | Role in the suite |
 |---|---|
 | keyhop | The only vault. Holds VPN profile files and credentials, encrypted with a Secure Enclave key. Releases them only to registered suite clients after Touch ID. |

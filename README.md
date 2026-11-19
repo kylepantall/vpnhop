@@ -46,10 +46,19 @@ vpnhop list
 |---|---|
 | `list_profiles` | Profiles, type, allowed hosts, tunnel state |
 | `http_request` | HTTP(S) via a profile; auto-connects |
+| `session_profile` | Returns a profile's fingerprint and credential names for a Keyhop plan |
 | `connect` / `disconnect` | Manual tunnel control |
 | `save_profile` / `remove_profile` | Save a profile file into keyhop, or delete one (Touch ID) |
 | `status` | State, plus the redacted client log |
 | `refresh` | Same as `vpnhop refresh` |
+
+### Use VPNHop in a Keyhop plan
+
+For a task with several requests or a mix of VPN and secret-backed local commands, ask your agent to use a single Keyhop plan. It calls VPNHop `session_profile` for each profile, includes its `profileHash` and `secretNames` in Keyhop's `vpn_http` steps, and submits the complete plan to Keyhop. Approve it once and authenticate once. Run the VPN steps through Keyhop's `run_session_step` so the pinned VPNHop install receives just the approved credentials.
+
+This works with self-contained profiles using Keyhop-backed credentials, such as profiles saved by `vpnhop add`. Keyhop checks that the registration and credentials are current. VPNHop checks the profile fingerprint, enforces its `allowHosts`, and uses TLS verification for HTTPS. Each step makes one request and returns any redirect without following it. Existing tunnels retain their idle leases.
+
+Update Keyhop and VPNHop together. The VPNHop installer re-pins the client, or run `vpnhop keyhop-register` from your terminal after updating. For Codex, register VPNHop with `codex mcp add vpnhop -- vpnhop serve` if it is not already configured.
 
 ## Install
 

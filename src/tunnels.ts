@@ -33,6 +33,7 @@ export type TunnelDeps = {
   resolver: (config: Config, keyhop: Record<string, string>) => SecretResolver;
   keyhop: Keyhop;
   ensureImage: () => Promise<string>;
+  requireSelfContained?: boolean;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -121,7 +122,9 @@ export class Tunnels {
     const wanted = keyhopRefs(profile).filter((n) => !this.#secrets.has(n));
     if (wanted.length)
       for (const [k, v] of Object.entries(await this.#deps.keyhop.get(wanted, `Connect VPN profile "${name}"`))) this.#secrets.set(k, v);
-    const staged = await stage(profile, config.dir, this.#deps.resolver(config, Object.fromEntries(this.#secrets)));
+    const staged = await stage(profile, config.dir, this.#deps.resolver(config, Object.fromEntries(this.#secrets)), {
+      requireSelfContained: this.#deps.requireSelfContained,
+    });
     const redact = redactor(staged.secrets);
 
     const create = await docker([
@@ -200,12 +203,12 @@ export class Tunnels {
     );
   }
 
-  async request(req: HttpRequest): Promise<HttpResponse> {
+  async request(req: HttpRequest, { verifyProfile = false } = {}): Promise<HttpResponse> {
     const config = this.#deps.loadConfig();
     const profile = getProfile(config, req.profile);
     let current: HttpRequest = { ...req, url: this.#allowed(targetUrl(req.url), req.profile, profile.allowHosts) };
     const container = containerName(req.profile);
-    if (!(await this.#isReady(container))) await this.connect(req.profile);
+    if (verifyProfile || !(await this.#isReady(container))) await this.connect(req.profile);
     for (let hop = 0; ; hop++) {
       const { args, input } = curlArgs(current);
       // lease-exec.sh extends the lease, then execs curl.
